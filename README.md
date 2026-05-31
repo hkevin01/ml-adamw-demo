@@ -155,18 +155,18 @@ A training epoch in this project follows a strict and repeatable sequence: batch
 
 ```mermaid
 sequenceDiagram
-    participant CLI as main
-    participant Train as train_fit
-    participant Model as model
-    participant Opt as optimizer
-    participant Sched as scheduler
-    participant Val as validate
-    CLI->>Train: setup and start run
-    Train->>Model: forward pass
-    Train->>Opt: backward then optimizer step
-    Train->>Sched: step per batch for onecycle
-    Train->>Val: run validation pass
-    Train->>Sched: step per epoch for cosine and linear
+    participant CLI
+    participant TRAIN
+    participant MODEL
+    participant OPTIMIZER
+    participant SCHEDULER
+    participant VALIDATE
+    CLI->>TRAIN: setup run
+    TRAIN->>MODEL: forward pass
+    TRAIN->>OPTIMIZER: backward and step
+    TRAIN->>SCHEDULER: onecycle batch step
+    TRAIN->>VALIDATE: validation pass
+    TRAIN->>SCHEDULER: cosine or linear epoch step
 ```
 
 This sequence diagram mirrors the exact training semantics implemented in src/train.py and is useful when adding callbacks or additional metrics.
