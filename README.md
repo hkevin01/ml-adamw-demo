@@ -15,6 +15,7 @@ This repository is a compact, production-style PyTorch training project designed
 ## Table of Contents
 
 - [What Is AdamW?](#what-is-adamw)
+- [Reader Guide](#reader-guide)
 - [Project Goals](#project-goals)
 - [Quickstart](#quickstart)
 - [System Architecture](#system-architecture)
@@ -25,6 +26,8 @@ This repository is a compact, production-style PyTorch training project designed
 - [Outputs and Artifacts](#outputs-and-artifacts)
 - [Collapsible API Reference](#collapsible-api-reference)
 - [Operational Tips and Notes](#operational-tips-and-notes)
+- [Implementation Checklist](#implementation-checklist)
+- [Architecture Decisions](#architecture-decisions)
 
 ## What Is AdamW?
 
@@ -46,6 +49,22 @@ Do not assume AdamW is always best. For very simple problems, strict memory budg
 | 6 | Maximizing final benchmark score | Compare AdamW vs SGD | Task-dependent winner after full tuning |
 
 Note: This table is a practical decision aid, not a universal ranking, because optimizer quality depends on data, architecture, and training budget.
+
+## Reader Guide
+
+This README is intentionally written as a working technical document rather than a short project blurb. If you are evaluating the repository for adoption, start with the architecture and scheduler sections to understand execution behavior and extension points. If you are trying to run experiments immediately, use the quickstart and CLI reference first, then return to the API and operational guidance when you begin making changes.
+
+> [!TIP]
+> The fastest path for new contributors is: Quickstart -> Training Lifecycle -> Learning-Rate Schedulers -> Collapsible API Reference.
+
+| # | Reader Role | Start Here | Then Continue With | Why This Path Works |
+| --- | --- | --- | --- | --- |
+| 1 | New contributor | Quickstart | Training Lifecycle | Gets code running before design deep-dive |
+| 2 | ML researcher | Learning-Rate Schedulers | CLI Reference | Optimizer and schedule controls are centralized |
+| 3 | Maintainer | System Architecture | Collapsible API Reference | Fastest way to identify safe edit boundaries |
+| 4 | Reviewer | Project Goals | Outputs and Artifacts | Connects intent to measurable outcomes |
+
+Note: This table helps different reader types find the right entry point without scanning the full document first.
 
 ## Project Goals
 
@@ -136,24 +155,18 @@ A training epoch in this project follows a strict and repeatable sequence: batch
 
 ```mermaid
 sequenceDiagram
-    participant CLI as main.py
-    participant Train as train.fit
-    participant Model as MLPClassifier
-    participant Opt as AdamW
-    participant Sched as Scheduler
-    participant Val as evaluate.validate
-    CLI->>Train: Build loaders, model, config
-    loop each epoch
-        Train->>Model: forward(x)
-        Train->>Opt: backward + step
-        alt scheduler is onecycle
-            Train->>Sched: step each batch
-        end
-        Train->>Val: run validation pass
-        alt scheduler is cosine or linear
-            Train->>Sched: step each epoch
-        end
-    end
+    participant CLI as main
+    participant Train as train_fit
+    participant Model as model
+    participant Opt as optimizer
+    participant Sched as scheduler
+    participant Val as validate
+    CLI->>Train: setup and start run
+    Train->>Model: forward pass
+    Train->>Opt: backward then optimizer step
+    Train->>Sched: step per batch for onecycle
+    Train->>Val: run validation pass
+    Train->>Sched: step per epoch for cosine and linear
 ```
 
 This sequence diagram mirrors the exact training semantics implemented in src/train.py and is useful when adding callbacks or additional metrics.
@@ -359,6 +372,39 @@ This final alert emphasizes experiment tracking discipline.
 | 6 | CUDA memory pressure | Lower batch size or disable amp for debug | Creates headroom and simplifies diagnosis |
 
 Note: This table is an operations playbook for common scheduler and convergence issues.
+
+## Implementation Checklist
+
+This checklist encodes expected engineering hygiene for changes to training logic and documentation. It is intentionally explicit so pull requests remain reproducible and reviewable even when optimizer and scheduler behavior is being tuned quickly.
+
+- [x] Add scheduler configurability across core policies
+- [x] Document optimizer and scheduler rationale in README
+- [x] Include visual architecture and lifecycle diagrams
+- [x] Provide collapsible API references for maintainers
+- [ ] Add unit tests for scheduler factory edge cases
+- [ ] Add benchmark comparison notebook for AdamW vs SGD
+
+> [!IMPORTANT]
+> Keep this checklist updated as scope changes so project status stays truthful for reviewers and contributors.
+
+## Architecture Decisions
+
+The project makes several deliberate architecture choices to balance readability with practical experimentation speed. Instead of abstracting every concern behind framework-heavy patterns, it keeps the code path explicit and linear so scheduler behavior can be inspected directly in training logs and history artifacts.
+
+| # | Decision | Current Choice | Benefit | Tradeoff |
+| --- | --- | --- | --- | --- |
+| 1 | Data source | Synthetic Gaussian dataset | Zero external setup and deterministic runs | Less representative of production data complexity |
+| 2 | Model style | Compact MLP classifier | Easy to reason about training dynamics | Not intended as SOTA architecture |
+| 3 | Optimizer | AdamW only | Stable default and decoupled regularization | No built-in SGD baseline yet |
+| 4 | Scheduler integration | Config-driven with mode switch | Rapid experimentation from CLI | More branches in training loop |
+| 5 | Metrics output | JSON + PNG artifacts | Human and machine-readable outputs | Does not include experiment database |
+| 6 | Precision control | Optional AMP | Better performance on supported hardware | Requires extra care in debugging numerics |
+
+Note: This table documents why each design choice exists, so future refactors can preserve intent instead of only behavior.
+
+A final recommendation: treat this repository as a strong baseline and experimentation harness. Once scheduler strategy and optimizer policy stabilize for your target domain, you can migrate the validated configuration into a larger production stack with confidence.[^1]
+
+[^1]: The architecture emphasizes observability and controlled iteration. That makes it ideal for learning and validation phases before infrastructure-heavy deployment.
 
 ## Project Structure
 
