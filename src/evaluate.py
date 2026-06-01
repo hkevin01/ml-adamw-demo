@@ -37,6 +37,9 @@ def validate(
         acc_sum += accuracy_from_logits(logits, y)
         num_batches += 1
 
+    # Postcondition: restore training mode so the caller's model state is unchanged.
+    model.train()
+
     if num_batches == 0:
         return 0.0, 0.0
     return loss_sum / num_batches, acc_sum / num_batches
