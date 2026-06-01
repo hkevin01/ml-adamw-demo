@@ -9,7 +9,7 @@
 [![Status](https://img.shields.io/badge/status-active-success?style=flat-square)](https://github.com/hkevin01/ml-adamw-demo)
 [![Docs](https://img.shields.io/badge/docs-detailed%20README-blueviolet?style=flat-square)](README.md)
 
-This repository is a production-style PyTorch training project built to demonstrate a complete supervised learning pipeline centered on the **AdamW** optimizer and configurable learning-rate schedulers. The project is intentionally designed to be small enough to read entirely in one sitting, yet structured closely enough to production code that lessons learned here transfer directly to larger systems. Every module, config field, and CLI flag exists for a specific reason, and this README documents all of them in depth.
+This repository is a production-style PyTorch training project built to demonstrate a complete supervised learning pipeline centered on the **AdamW** optimizer (an adaptive gradient-descent algorithm with decoupled L2 regularization) and configurable learning-rate schedulers (algorithms that change the step size during training). The project is intentionally designed to be small enough to read entirely in one sitting, yet structured closely enough to production code that lessons learned here transfer directly to larger systems. Every module, config field, and CLI flag exists for a specific reason, and this README documents all of them in depth.
 
 The code separates data creation, model definition, training, evaluation, and utility concerns into distinct modules so each layer can be understood, tested, and replaced independently. If you are learning optimizer behavior, scheduler dynamics, reproducible experiment setup, or PyTorch best practices at the same time, this project gives you a working baseline rather than a toy snippet.
 
@@ -20,6 +20,7 @@ The code separates data creation, model definition, training, evaluation, and ut
 
 ## Table of Contents
 
+- [Glossary of Key Terms](#glossary-of-key-terms)
 - [What Is AdamW?](#what-is-adamw)
 - [Project Goals](#project-goals)
 - [Reader Guide](#reader-guide)
@@ -40,11 +41,76 @@ The code separates data creation, model definition, training, evaluation, and ut
 
 ---
 
+## Glossary of Key Terms
+
+This glossary defines every significant technical term used in this README and in the source code. Terms are listed alphabetically. You do not need to read this section top-to-bottom; use it as a reference while reading other sections.
+
+> [!TIP]
+> If you encounter an unfamiliar term anywhere in this README, come back here first before searching externally. Most concepts are defined below with enough context to understand how they apply specifically to this project.
+
+| # | Term | Plain-English Definition |
+| --- | --- | --- |
+| 1 | **Ablation** | A controlled experiment where one component is removed or disabled to measure its contribution. In this project, running with `--scheduler none` is an ablation of the scheduler. |
+| 2 | **Adam** | Adaptive Moment Estimation. An optimizer that maintains a running average of past gradients (first moment) and past squared gradients (second moment) to scale each parameter's step size individually. |
+| 3 | **AdamW** | Adam with decoupled Weight decay. Identical to Adam except that L2 regularization is applied directly to the weights after the gradient update rather than being folded into the gradient itself. This prevents the adaptive scaling from interfering with regularization. |
+| 4 | **AMP** | Automatic Mixed Precision. A training technique that uses 16-bit floating point for most operations and 32-bit only where numerical precision is critical. Reduces memory usage and speeds up training on NVIDIA GPUs without significant accuracy loss. |
+| 5 | **Argparse** | Python standard library module used to define and parse command-line arguments. Every `--flag` in this project is declared via argparse in `src/main.py`. |
+| 6 | **Artifact** | A file produced by a training run - in this project, `history.json` and `curves.png`. Artifacts persist after the process exits and serve as the audit trail for an experiment. |
+| 7 | **Autograd** | PyTorch's automatic differentiation engine. When you call `loss.backward()`, autograd traverses the computation graph and computes the gradient of the loss with respect to every parameter that has `requires_grad=True`. |
+| 8 | **Backward pass** | The phase of training where gradients are computed by propagating the loss signal backwards through the network using the chain rule. Follows the forward pass. |
+| 9 | **Batch / Mini-batch** | A fixed-size subset of the training dataset used for one gradient update step. Smaller batches introduce more gradient noise (which can act as regularization); larger batches give smoother but potentially sharper minima. |
+| 10 | **Checkpoint** | A saved copy of model weights at a specific point during training. This project saves `best_model.pt` whenever validation loss improves, so you can reload the best weights after training completes. |
+| 11 | **CI** | Continuous Integration. An automated system that runs tests and validation checks on every code change. This project uses GitHub Actions, defined in `.github/workflows/ci.yml`. |
+| 12 | **CLI** | Command-Line Interface. The set of `--flags` and arguments accepted by `python src/main.py`. Every experiment in this project is controlled entirely through the CLI. |
+| 13 | **CosineAnnealingLR** | A PyTorch learning-rate scheduler that decays the LR following the shape of a cosine curve from the initial value toward `eta_min` over `T_max` epochs. The decay is slow at first, fast in the middle, and slow again near the end. |
+| 14 | **CrossEntropyLoss** | The standard loss function for multi-class classification. It measures how far the model's predicted probability distribution is from the true class label. Internally combines a log-softmax with a negative log-likelihood computation. |
+| 15 | **CUDA** | Compute Unified Device Architecture. NVIDIA's parallel computing platform that enables GPU acceleration. PyTorch uses CUDA to run tensor operations on NVIDIA GPUs. AMP is only active when CUDA is available. |
+| 16 | **Dataclass** | A Python class decorated with `@dataclass` that auto-generates `__init__`, `__repr__`, and other methods from field declarations. Marking it `frozen=True` makes all fields immutable after construction, preventing accidental mid-run mutation. |
+| 17 | **DataLoader** | A PyTorch utility that wraps a Dataset and yields shuffled, batched tensors during iteration. It handles multiprocessing, pinned memory for GPU transfers, and sampling strategy. |
+| 18 | **Divergence** | When training loss grows uncontrollably or becomes `nan` / `inf` instead of decreasing. Usually caused by a learning rate that is too high, which causes gradient updates to overshoot the loss minimum repeatedly. |
+| 19 | **Dropout** | A regularization technique that randomly sets a fraction of neuron activations to zero during training. This prevents neurons from co-adapting too tightly and forces the network to learn more robust representations. Disabled during inference via `model.eval()`. |
+| 20 | **Epoch** | One complete pass through the entire training dataset. If a dataset has 4800 training samples and the batch size is 128, one epoch consists of 37-38 gradient update steps. |
+| 21 | **Fine-tuning** | Taking a model already trained on a large dataset (e.g. a pretrained language model) and continuing training on a smaller, task-specific dataset. AdamW is particularly well-suited to fine-tuning because its decoupled weight decay behaves predictably even with frozen layers. |
+| 22 | **Forward pass** | The phase of training where input data flows through the network layer-by-layer to produce predictions (logits). Gradients are not computed during this phase; that happens in the backward pass. |
+| 23 | **Gaussian / Normal distribution** | A probability distribution shaped like a bell curve, parameterized by mean and standard deviation. The synthetic dataset in this project generates class-labeled clusters drawn from separate Gaussian distributions. |
+| 24 | **Gradient** | The vector of partial derivatives of the loss function with respect to each model parameter. Points in the direction of steepest increase; the optimizer steps in the opposite direction to minimize the loss. |
+| 25 | **GradScaler** | A PyTorch component used with AMP. It scales the loss upward before the backward pass to avoid underflow in float16 gradients, then unscales before the optimizer step. Only active when CUDA is available. |
+| 26 | **Hyperparameter** | A parameter that is set before training begins and is not learned from data. Examples include learning rate, weight decay, batch size, and the number of epochs. Contrast with model parameters (weights), which are learned during training. |
+| 27 | **JSON** | JavaScript Object Notation. A human-readable text format for structured data. This project stores per-epoch training metrics in `artifacts/history.json` so they can be loaded by scripts and notebooks without any special tooling. |
+| 28 | **L2 regularization** | A regularization technique that adds a penalty proportional to the squared magnitude of model weights to the loss function. Encourages smaller weights and reduces overfitting. AdamW applies this as decoupled weight decay rather than via the gradient. |
+| 29 | **Learning rate (LR)** | A scalar that controls how large each parameter update step is. The optimizer multiplies the gradient by the learning rate to compute the update. It is the single most important hyperparameter to tune. |
+| 30 | **LinearLR** | A PyTorch learning-rate scheduler that decays the LR in a straight line from `start_factor * initial_lr` down to `end_factor * initial_lr` over `total_iters` steps. The simplest possible monotone decay. |
+| 31 | **Logits** | The raw, unnormalized output values from the final linear layer of a classifier, before any softmax or sigmoid is applied. `CrossEntropyLoss` expects logits as input and applies log-softmax internally. |
+| 32 | **LR schedule / Scheduler** | An algorithm that changes the learning rate during training according to a predefined policy. Examples are cosine decay, linear decay, and one-cycle warmup-then-decay. |
+| 33 | **MLP** | Multi-Layer Perceptron. A feedforward neural network composed of fully-connected (Linear) layers with non-linear activations between them. The simplest class of deep learning model and the architecture used in this project. |
+| 34 | **Momentum** | A technique used in SGD that accumulates a velocity vector in the direction of persistent gradient directions, dampening oscillations and accelerating convergence in consistent directions. |
+| 35 | **nn.Module** | The base class for all neural network components in PyTorch. Every model, layer, loss function, and activation is a subclass of `nn.Module`. Provides parameter tracking, `train()`/`eval()` mode switching, and device management. |
+| 36 | **OneCycleLR** | A PyTorch learning-rate scheduler implementing the one-cycle policy: LR increases from a low value to `max_lr` during warmup, then decreases to a very low final value. Must be stepped once per batch rather than once per epoch. |
+| 37 | **Overfitting** | When a model learns the training data too well, including its noise, and performs poorly on new unseen data. Symptom: `train_loss` is much lower than `val_loss`. Remedied by regularization, more data, or a smaller model. |
+| 38 | **PNG** | Portable Network Graphics. A lossless image format used here for saving training curve plots. Suitable for CI artifacts and reports because it renders cleanly at any zoom level. |
+| 39 | **ReLU** | Rectified Linear Unit. An activation function defined as `max(0, x)`. It is used after each hidden linear layer in the MLP to introduce non-linearity, which is what allows the network to learn curved decision boundaries. |
+| 40 | **Reproducibility** | The property that two runs with the same configuration and seed produce identical results. Achieved here by seeding Python, NumPy, and PyTorch RNGs before any randomness is introduced. |
+| 41 | **RNG** | Random Number Generator. A deterministic algorithm that produces a sequence of pseudo-random numbers given an initial seed. Setting the seed to a fixed value ensures the same sequence is generated each run. |
+| 42 | **SGD** | Stochastic Gradient Descent. An optimizer that updates parameters by subtracting the gradient multiplied by the learning rate. With momentum, it accumulates velocity. Simpler state than Adam-family but often requires more careful LR tuning. |
+| 43 | **Softmax** | A function that converts a vector of raw logits into a probability distribution (values sum to 1, all non-negative). `CrossEntropyLoss` applies log-softmax internally, so the model outputs raw logits. |
+| 44 | **Tensor** | The core data structure in PyTorch. An n-dimensional array of typed numeric values (float32, float16, etc.) that can live in CPU or GPU memory and tracks gradients for automatic differentiation. |
+| 45 | **Train/val split** | Dividing the dataset into a training portion (used for gradient updates) and a validation portion (used only for evaluation, never for gradient updates). Measures generalization to unseen data. |
+| 46 | **Underfitting** | When a model is too simple or undertrained to capture the patterns in the data. Symptom: both `train_loss` and `val_loss` are high and not decreasing. Remedied by a larger model, more epochs, or a higher learning rate. |
+| 47 | **val_acc / val_loss** | Validation accuracy and validation loss. Metrics computed on the held-out validation split after each epoch. These are the primary indicators of generalization quality; they are never used to update model weights. |
+| 48 | **Virtual environment (venv)** | An isolated Python installation that keeps project dependencies separate from the system Python. Created with `python -m venv .venv`; activated with `source .venv/bin/activate`. Required here because PyTorch must be installed locally. |
+| 49 | **Weight decay** | The coefficient that controls how strongly AdamW shrinks weights toward zero after each update. Equivalent to L2 regularization but applied decoupled from the gradient step in AdamW. Higher values reduce overfitting; too-high values cause underfitting. |
+| 50 | **Warmup** | A period at the start of training where the learning rate is intentionally held low and gradually increased. Helps avoid instability when model weights are randomly initialized and gradients are noisy. Used in OneCycleLR via `pct_start`. |
+
+> [!NOTE]
+> Terms like **Adam**, **SGD**, **AMP**, **CUDA**, and **MLP** are industry-standard abbreviations. If you are new to deep learning, reading entries 9, 20, 24, 29, and 33 in that order gives the minimum vocabulary needed to understand the rest of this README.
+
+---
+
 ## What Is AdamW?
 
-AdamW is an optimizer that builds on the Adam algorithm by fixing the way weight decay is applied. The original Adam optimizer coupled weight decay into the gradient update calculation, which caused the adaptive learning-rate scaling to interfere with regularization in ways that were difficult to predict or control. AdamW decouples weight decay from the gradient update entirely, applying it directly to the weights after the gradient step. This separation makes regularization behave more predictably and consistently, regardless of the adaptive scaling happening simultaneously.
+AdamW is an optimizer - an algorithm that updates model weights (parameters) to minimize a loss function - that builds on the Adam algorithm by fixing the way weight decay is applied. **Weight decay** is a form of L2 regularization that penalizes large weight values to reduce overfitting; it works by shrinking each weight by a small fraction after every update. The original Adam optimizer coupled weight decay into the gradient update calculation, which caused the adaptive learning-rate scaling to interfere with regularization in ways that were difficult to predict or control. AdamW decouples weight decay from the gradient update entirely, applying it directly to the weights after the gradient step. This separation makes regularization behave more predictably and consistently, regardless of the adaptive scaling happening simultaneously.
 
-In practice, decoupled weight decay means you can tune `weight_decay` as a straightforward regularization strength without worrying about cross-contamination from the gradient moment estimates. This makes AdamW significantly easier to tune than vanilla Adam with L2 regularization and is why AdamW has become the default optimizer in most modern deep learning workflows.
+In practice, decoupled weight decay means you can tune `weight_decay` as a straightforward regularization strength without worrying about cross-contamination from the **gradient moment estimates** (the running averages of past gradients and past squared gradients that Adam uses to adapt the step size per parameter). This makes AdamW significantly easier to tune than vanilla Adam with L2 regularization and is why AdamW has become the default optimizer in most modern deep learning workflows.
 
 AdamW is the standard optimizer for transformer-based NLP, including BERT, GPT-style language models, and foundation model training runs. It is equally effective for convolutional image classifiers, graph neural networks, tabular deep learning systems, and reinforcement learning policy networks. Wherever you need a solid adaptive optimizer that responds well to scheduler tuning and does not require optimizer-specific tricks to reach good results, AdamW is a safe and well-validated starting point.
 
@@ -69,7 +135,7 @@ You should consider alternatives when working with very small datasets or very s
 
 This project has five explicit engineering goals that shape every design decision from module boundaries to CLI flags. The goals are stated here so that when you read the code or extend the project, you understand what tradeoffs were made intentionally versus accidentally.
 
-The first goal is **clarity**: every piece of logic lives in the module most naturally responsible for it, so there is never a question of where to look when debugging or extending behavior. The second goal is **reproducibility**: seeds are fixed at the start of every run, and all configurable parameters flow through explicit config dataclasses rather than global state or ambient variables. The third goal is **scheduler exploration**: the project is explicitly designed to make it easy to compare LR schedule policies by swapping a single CLI flag without changing any source code. The fourth goal is **production habits**: metrics are persisted to JSON and plots to PNG after every run so there is a permanent audit trail without requiring external tooling. The fifth goal is **portability**: the code defaults to CPU and only activates CUDA-specific features like AMP when a GPU is present.
+The first goal is **clarity**: every piece of logic lives in the module most naturally responsible for it, so there is never a question of where to look when debugging or extending behavior. The second goal is **reproducibility**: **seeds** (fixed starting values for random number generators) are set at the start of every run, and all configurable parameters flow through explicit config **dataclasses** (typed, immutable Python objects) rather than global state or ambient variables. The third goal is **scheduler exploration**: the project is explicitly designed to make it easy to compare **LR schedule policies** (algorithms that change the learning rate during training) by swapping a single CLI flag without changing any source code. The fourth goal is **production habits**: metrics are persisted to **JSON** (a portable text-based data format) and plots to **PNG** (a lossless image format) after every run so there is a permanent audit trail without requiring external tooling. The fifth goal is **portability**: the code defaults to CPU and only activates **CUDA**-specific features like **AMP** (Automatic Mixed Precision, which uses 16-bit floats to save memory and speed up GPU training) when a GPU is present.
 
 | # | Goal | Concrete Behavior | Why This Goal Exists |
 | --- | --- | --- | --- |
@@ -274,7 +340,7 @@ flowchart LR
 
 ## Model Architecture
 
-The model used in this project is a multi-layer perceptron (MLP) classifier implemented in `src/model.py`. It accepts a flat feature vector of configurable dimension, passes it through two hidden layers with ReLU activations and dropout regularization, and produces a logit vector over the output classes. The architecture is deliberately simple so that training dynamics are dominated by optimizer and scheduler behavior rather than model complexity.
+The model used in this project is a **multi-layer perceptron (MLP)** classifier - a feedforward neural network made of stacked fully-connected layers - implemented in `src/model.py`. It accepts a flat feature vector of configurable dimension, passes it through two hidden layers with **ReLU** activations (a non-linear function `max(0, x)` that lets the network learn curved decision boundaries) and **dropout** regularization (random zeroing of activations during training to prevent co-adaptation), and produces a **logit** vector (raw unnormalized scores, one per class) over the output classes. The architecture is deliberately simple so that training dynamics are dominated by optimizer and scheduler behavior rather than model complexity.
 
 The two-hidden-layer MLP is a strong baseline for classification on low-to-medium dimensional feature spaces. It has enough capacity to learn non-linear decision boundaries while remaining fast to train on CPU. The dropout regularization in each hidden layer discourages co-adaptation of neurons, which slightly regularizes the model and makes the effect of `weight_decay` more observable in validation curves.
 
@@ -303,7 +369,7 @@ The MLP is not intended to be state-of-the-art for any particular task. Its purp
 
 ## Training Lifecycle
 
-A complete training run proceeds through a well-defined lifecycle from CLI argument parsing through artifact persistence. Understanding each phase helps when adding new functionality such as early stopping, model checkpointing, gradient clipping, or custom per-epoch callbacks.
+A complete training run proceeds through a well-defined lifecycle from CLI argument parsing through artifact persistence. Understanding each phase helps when adding new functionality such as **early stopping** (halting training when validation loss stops improving), **model checkpointing** (saving weights when a new best validation loss is achieved), **gradient clipping** (capping gradient magnitude to prevent exploding updates), or custom per-epoch callbacks.
 
 The training loop in `src/train.py` explicitly separates per-batch logic from per-epoch logic. Per-batch logic includes the forward pass, loss computation, backward pass, optimizer step, and OneCycleLR scheduler step when OneCycleLR is selected. Per-epoch logic includes the validation pass, non-OneCycleLR scheduler steps, and history recording. This separation is what allows different schedulers to use the correct step timing without requiring special cases scattered throughout the loop body.
 
@@ -351,7 +417,7 @@ sequenceDiagram
 
 ## Learning-Rate Schedulers
 
-Learning-rate scheduling is one of the highest-impact decisions in a training run. A good schedule can reduce training time, improve final validation accuracy, and prevent loss spikes late in training. A poorly matched schedule can cause early divergence, oscillating validation metrics, or premature convergence. This project supports four scheduler modes and is designed to make comparing them as frictionless as possible.
+**Learning-rate scheduling** is the practice of changing the learning rate (the step size used for each parameter update) according to a policy during training. It is one of the highest-impact decisions in a training run. A good schedule can reduce training time, improve final validation accuracy, and prevent loss spikes late in training. A poorly matched schedule can cause early **divergence** (loss growing uncontrollably instead of decreasing), oscillating validation metrics, or premature convergence to a suboptimal solution. This project supports four scheduler modes and is designed to make comparing them as frictionless as possible.
 
 The fundamental insight behind LR scheduling is that the optimal step size changes over the course of training. Early in training, large steps help explore the loss landscape quickly and escape bad initializations. Later in training, smaller steps allow the optimizer to settle into the bottom of a local minimum without repeatedly overshooting. Different schedulers model this intuition differently, each with tradeoffs in simplicity, control, and convergence behavior.
 
@@ -404,7 +470,7 @@ flowchart TD
 
 Choosing good AdamW hyperparameters has a larger effect on training outcomes than model architecture in many practical settings. This section explains each parameter mechanistically and gives systematic guidance for tuning.
 
-**Learning rate** (`--lr`) controls the step size for each parameter update. It is the single most important hyperparameter in any gradient-based training setup. Set it too high and training diverges. Set it too low and training converges slowly or stalls entirely in a plateau. The default `1e-3` is a well-tested starting point, but treat it as an initial guess rather than a fixed value. For fine-tuning pretrained models, a learning rate in the range `1e-5` to `1e-4` is often more appropriate.
+**Learning rate** (`--lr`) controls the step size for each parameter update. It is the single most important **hyperparameter** (a value set before training that is not learned from data, as opposed to weights which are learned) in any gradient-based training setup. Set it too high and training diverges. Set it too low and training converges slowly or stalls entirely in a **plateau** (a region of the loss surface where the gradient is near zero and progress stops). The default `1e-3` is a well-tested starting point, but treat it as an initial guess rather than a fixed value. For fine-tuning pretrained models, a learning rate in the range `1e-5` to `1e-4` is often more appropriate.
 
 **Weight decay** (`--weight-decay`) applies L2-style regularization to model weights after each optimizer step. In AdamW this is done by multiplying each weight by `(1 - lr * weight_decay)` directly, independent of the gradient. Higher values push weights toward zero more aggressively, reducing overfitting at the cost of potentially underfitting if set too high. The default `1e-2` is a reasonable starting point for medium-sized networks trained from scratch.
 
@@ -423,7 +489,7 @@ Choosing good AdamW hyperparameters has a larger effect on training outcomes tha
 
 ## CLI Reference
 
-The CLI is the primary control surface for running experiments. Every parameter relevant to data, model, optimizer, and scheduler is exposed as a flag so experiments are fully reproducible from the command used to run them. Designing experiments as CLI invocations rather than code edits has several advantages: it makes experiment history easy to reconstruct from shell logs, it allows automation scripts and CI pipelines to drive training runs programmatically, and it allows the same codebase to serve as a reusable harness for many different experimental configurations without creating diverging code forks.
+The **CLI** (Command-Line Interface) is the primary control surface for running experiments. Every parameter relevant to data, model, optimizer, and scheduler is exposed as a `--flag` argument so experiments are fully reproducible from the command used to run them. This means any experiment can be re-run exactly by copying the command from a shell log or CI output, with no source code changes required. Designing experiments as CLI invocations rather than code edits has several advantages: it makes experiment history easy to reconstruct from shell logs, it allows automation scripts and CI pipelines to drive training runs programmatically, and it allows the same codebase to serve as a reusable harness for many different experimental configurations without creating diverging code forks.
 
 ```mermaid
 flowchart LR
@@ -708,11 +774,11 @@ This checklist tracks the current state of the implementation against the intend
 - [x] Dependabot configuration for pip and GitHub Actions
 - [x] Issue and PR templates
 - [x] CONTRIBUTING.md and SECURITY.md community health files
-- [ ] Unit tests for `_build_scheduler` factory covering all four modes and error path
-- [ ] Unit tests for `validate()` numerical correctness
+- [x] Unit tests for `_build_scheduler` factory covering all four modes and error path
+- [x] Unit tests for `validate()` numerical correctness
 - [ ] Benchmark notebook comparing all four schedulers on identical data and seed
 - [ ] SGD with momentum baseline for direct AdamW comparison
-- [ ] Model checkpointing to save weights at best validation accuracy
+- [x] Model checkpointing to save weights at best validation accuracy (`--checkpoint-dir`)
 
 > [!IMPORTANT]
 > Before implementing any unchecked item, run the smoke test to confirm the pipeline is intact. Any change to `src/train.py` or `src/evaluate.py` should be immediately followed by a two-epoch CPU verification run.
