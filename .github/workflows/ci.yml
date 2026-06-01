@@ -30,6 +30,10 @@ jobs:
         run: |
           python -m compileall src
 
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ -v
+
       - name: Smoke run training
         run: |
           python src/main.py --epochs 1 --n-samples 256 --batch-size 64 --scheduler none --no-amp --artifacts-dir artifacts/ci-smoke

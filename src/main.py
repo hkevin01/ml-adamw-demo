@@ -57,6 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-amp", action="store_true")
 
     parser.add_argument("--artifacts-dir", type=str, default="artifacts")
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="If set, best-val-loss model weights are saved to <dir>/best_model.pt",
+    )
     return parser.parse_args()
 
 
@@ -96,6 +102,7 @@ def main() -> None:
         onecycle_pct_start=args.onecycle_pct_start,
         onecycle_div_factor=args.onecycle_div_factor,
         onecycle_final_div_factor=args.onecycle_final_div_factor,
+        checkpoint_dir=args.checkpoint_dir,
     )
 
     history = fit(

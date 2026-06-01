@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
 import torch
 from torch import nn
@@ -22,6 +25,8 @@ class TrainConfig:
     onecycle_pct_start: float = 0.3
     onecycle_div_factor: float = 25.0
     onecycle_final_div_factor: float = 1e4
+    # Optional path; if set, best-val-loss weights are saved here as best_model.pt
+    checkpoint_dir: Optional[str] = None
 
 
 def _build_scheduler(
@@ -153,6 +158,12 @@ def fit(
         "lr": [],
     }
 
+    # Checkpointing state: track best val_loss and save weights when it improves.
+    best_val_loss: float = float("inf")
+    ckpt_dir: Optional[Path] = Path(config.checkpoint_dir) if config.checkpoint_dir else None
+    if ckpt_dir is not None:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
     for epoch in range(1, config.epochs + 1):
         train_loss, train_acc = _train_one_epoch(
             model=model,
@@ -182,11 +193,19 @@ def fit(
         history["val_acc"].append(val_acc)
         history["lr"].append(current_lr)
 
+        # Save a checkpoint when validation loss improves.
+        checkpoint_tag = ""
+        if ckpt_dir is not None and val_loss < best_val_loss:
+            best_val_loss = val_loss
+            ckpt_path = ckpt_dir / "best_model.pt"
+            torch.save(copy.deepcopy(model).cpu().state_dict(), ckpt_path)
+            checkpoint_tag = " [ckpt saved]"
+
         print(
             f"Epoch {epoch:03d}/{config.epochs:03d} "
             f"| train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
             f"| val_loss={val_loss:.4f} val_acc={val_acc:.4f} "
-            f"| lr={current_lr:.6f}"
+            f"| lr={current_lr:.6f}{checkpoint_tag}"
         )
 
     return history
