@@ -32,6 +32,7 @@ This project is also a template for how to write a maintainable deep learning tr
 - [Glossary of Key Terms](#glossary-of-key-terms)
 - [What Is AdamW?](#what-is-adamw)
 - [How AdamW Works Internally](#how-adamw-works-internally)
+- [AdamW End-to-End Process Walkthrough](#adamw-end-to-end-process-walkthrough)
 - [Project Goals](#project-goals)
 - [Reader Guide](#reader-guide)
 - [Quickstart](#quickstart)
@@ -182,6 +183,109 @@ The key insight in this diagram is that weight decay (`WD`) is a separate operat
 
 > [!IMPORTANT]
 > PyTorch's `AdamW` implementation uses `amsgrad=False` by default. AMSGrad is a variant that uses the maximum of past second moments instead of the running average, which provides stronger theoretical convergence guarantees but often performs similarly in practice. The default is correct for most use cases.
+
+---
+
+## AdamW End-to-End Process Walkthrough
+
+This section traces everything that happens from the moment you run `python src/main.py` to the moment `history.json` is written to disk, with explicit focus on every place AdamW is involved. Each step explains what runs, what code triggers it, and why that step is necessary for AdamW to work correctly. Reading this linearly gives you the complete mental model of applying AdamW in a real training pipeline.
+
+The process has three distinct scopes: **run-once setup** steps that happen before the training loop starts, **per-batch steps** that happen inside the inner loop on every mini-batch, and **per-epoch steps** that happen once after all batches for an epoch are exhausted. AdamW itself only runs during the per-batch phase, but the surrounding setup determines the quality and correctness of every update it makes.
+
+> [!NOTE]
+> The step numbers below map directly to the `Phase` column. Steps 1–8 are run-once setup. Steps 9–17 repeat for every batch in every epoch. Steps 18–22 repeat once per epoch. Steps 23–24 happen once after all epochs complete.
+
+### Phase 1 — Run-Once Setup (happens before any training batch)
+
+| Step | What Runs | Where in Code | Why It Is Needed for AdamW |
+| --- | --- | --- | --- |
+| 1 | **Parse CLI args** | `main.py → parse_args()` | Reads `--lr`, `--weight-decay`, `--scheduler`, `--epochs`, and every other parameter that configures AdamW and its schedule. Without this step, all values would be hardcoded and no comparison between runs would be possible. |
+| 2 | **Set global seed** | `main.py → set_seed(seed)` | Seeds Python, NumPy, PyTorch CPU, and CUDA RNGs. This ensures that weight initialization (step 6) and data shuffling (step 8) are identical across runs with the same `--seed`, which is mandatory for meaningful scheduler comparisons. |
+| 3 | **Construct DataConfig** | `main.py → DataConfig(...)` | Assembles an immutable config object carrying dataset size, feature count, class count, batch size, and val fraction. These values determine how many gradient steps occur per epoch, which directly affects how far OneCycleLR advances per epoch. |
+| 4 | **Construct TrainConfig** | `main.py → TrainConfig(...)` | Assembles an immutable config object carrying `lr`, `weight_decay`, `scheduler` name, all scheduler-specific parameters, and `use_amp`. This object is the single source of truth for every AdamW construction and scheduler construction call downstream. |
+| 5 | **Generate synthetic dataset** | `data.py → get_dataloaders(config)` | Creates the Gaussian classification clusters, splits into train/val, and wraps both in DataLoaders. The training DataLoader shuffle is seeded. This step must run after `set_seed` so data layout is reproducible. |
+| 6 | **Initialize model weights** | `model.py → MLPClassifier(...)` | Constructs the MLP and initializes all weight tensors with PyTorch's default initialization (Kaiming uniform for Linear layers). This must happen before AdamW is constructed because AdamW needs references to the exact parameter tensors it will update. |
+| 7 | **Construct AdamW optimizer** | `train.py → fit() → torch.optim.AdamW(model.parameters(), lr=..., weight_decay=...)` | Creates the AdamW optimizer and binds it to the model's parameter list. At this point AdamW allocates its internal state tensors — first moment `m` and second moment `v` — one pair per model parameter, all initialized to zero. This is the moment AdamW comes into existence for the run. |
+| 8 | **Construct LR scheduler** | `train.py → _build_scheduler(optimizer, config, steps_per_epoch)` | Creates the scheduler (e.g. CosineAnnealingLR) and wraps the AdamW optimizer. The scheduler does not replace AdamW; it controls AdamW's `lr` field in its parameter group. The `step_on_batch` flag is set here to True for OneCycleLR and False for all others. |
+
+> [!TIP]
+> Steps 7 and 8 are the two AdamW-specific construction steps. Everything before them is preparation. If either fails, training cannot start. The most common failure at step 7 is passing `model.parameters()` after moving the model to a different device — always call `model.to(device)` before constructing the optimizer.
+
+### Phase 2 — Per-Batch Training Loop (repeats for every mini-batch in every epoch)
+
+This is where AdamW does its core work. For each mini-batch, the following 9 steps execute in strict order. Changing the order of any of these steps produces incorrect results.
+
+| Step | What Runs | Where in Code | Why the Order Matters for AdamW |
+| --- | --- | --- | --- |
+| 9 | **Zero gradients** | `optimizer.zero_grad()` | Clears the `.grad` attribute on every model parameter. PyTorch accumulates gradients by addition, so failing to zero before the forward pass would mix gradients from the current batch with leftover gradients from the previous batch. AdamW would then update from incorrect, mixed gradient information. |
+| 10 | **Forward pass under autocast** | `model(x)` inside `torch.autocast(...)` | Runs the input tensor through the MLP layers to produce logits. If AMP is active, intermediate activations are computed in float16 to save memory and bandwidth. The model parameters stay in float32; only the activations are cast. |
+| 11 | **Compute loss** | `criterion(logits, targets)` | CrossEntropyLoss computes the scalar loss value that quantifies how wrong the model's predictions are. This scalar is the starting point for backpropagation. The loss value is also accumulated to compute the epoch mean loss logged at the end of the epoch. |
+| 12 | **Scale loss (AMP only)** | `scaler.scale(loss)` | GradScaler multiplies the loss by a large scale factor before the backward pass. This prevents float16 gradients from underflowing to zero during backpropagation, which would silently stop AdamW from receiving useful gradient signal. On CPU or with `--no-amp`, this is a no-op identity operation. |
+| 13 | **Backward pass** | `scaled_loss.backward()` | PyTorch's autograd engine traverses the computation graph in reverse and computes `∂loss/∂w` for every parameter `w` with `requires_grad=True`. These partial derivatives are accumulated into each parameter's `.grad` attribute. This step populates the raw gradient values that AdamW will consume in step 15. |
+| 14 | **Unscale gradients (AMP only)** | `scaler.unscale_(optimizer)` | Divides every gradient in the optimizer's parameter groups by the same scale factor applied in step 12. After this step, gradients are back to their true float32 magnitudes and AdamW can use them correctly. On CPU this is a no-op. |
+| 15 | **AdamW optimizer step** | `scaler.step(optimizer)` or `optimizer.step()` | **This is the AdamW update.** For each parameter, AdamW reads `.grad`, updates its `m` and `v` moment estimates, applies bias correction, computes the adaptive step `delta`, applies weight decay directly to the weight, then subtracts `delta` from the weight. This is the only step where model weights actually change. |
+| 16 | **Update GradScaler (AMP only)** | `scaler.update()` | Examines whether any gradients overflowed during the backward pass. If overflow is detected, the optimizer step was skipped and the scale factor is halved. If no overflow occurred for several consecutive batches, the scale factor is increased. On CPU this is a no-op. |
+| 17 | **Batch scheduler step (OneCycleLR only)** | `scheduler.step()` if `step_on_batch=True` | Advances the OneCycleLR schedule by one step, updating AdamW's `lr` in its parameter group for the next batch. For all other schedulers this branch does not execute; their step happens at epoch boundary instead (step 20). |
+
+> [!WARNING]
+> Step 15 must not be called directly as `optimizer.step()` when AMP is active. `scaler.step(optimizer)` internally checks for overflow and skips the step if gradients are infinite. Calling `optimizer.step()` directly bypasses this check and applies corrupt gradients to the model weights. The existing code is correct; preserve this pattern when modifying the training loop.
+
+> [!IMPORTANT]
+> Steps 9 through 17 repeat for every batch. For a 6000-sample dataset with a 20% val split and batch size 128, one epoch consists of approximately 37 batches. Over 30 epochs that is roughly 1,110 AdamW update steps. The moment estimates `m` and `v` grow more accurate with each step because they accumulate gradient history — this is why models typically improve more per step later in training than in the first few batches.
+
+### Phase 3 — Per-Epoch Boundary (happens once after all batches for an epoch are done)
+
+| Step | What Runs | Where in Code | Why It Is Needed for AdamW |
+| --- | --- | --- | --- |
+| 18 | **Validation pass** | `evaluate.py → validate(model, val_loader, ...)` | Runs the model in `eval()` mode (disables dropout) on the held-out validation split with `torch.no_grad()` to skip gradient computation. Returns `(val_loss, val_acc)`. No AdamW updates occur here. This is a pure measurement step. |
+| 19 | **Restore train mode** | `model.train()` at end of `validate()` | Re-enables dropout after the validation pass. Forgetting this would silently disable dropout for all subsequent training batches, causing the model to train without regularization while `val_acc` looks normal. |
+| 20 | **Epoch scheduler step (cosine/linear)** | `scheduler.step()` if `step_on_batch=False` | Advances CosineAnnealingLR or LinearLR by one epoch, updating AdamW's `lr` field in its parameter group. The new LR takes effect starting with the first batch of the next epoch. OneCycleLR does not step here because it already stepped per-batch in step 17. |
+| 21 | **Checkpoint save (if improved)** | `train.py → torch.save(state_dict, ckpt_path)` if `val_loss < best_val_loss` | Saves a CPU copy of the model's state dictionary when this epoch's `val_loss` is lower than any previously seen value. This preserves the best-generalization snapshot of the AdamW-trained weights across the full run. Requires `--checkpoint-dir` to be set. |
+| 22 | **Record history** | `history[key].append(value)` in `fit()` | Appends `train_loss`, `train_acc`, `val_loss`, `val_acc`, and the current AdamW `lr` (read from `optimizer.param_groups[0]["lr"]`) to the history lists. The `lr` value recorded here reflects whatever the scheduler set for this epoch. |
+
+> [!NOTE]
+> The `lr` value saved in `history["lr"]` at step 22 is read directly from the optimizer's parameter group, not from the scheduler object. This means it reflects the exact LR that AdamW used for the last batch of the epoch, which is the most accurate representation of the schedule's effect regardless of scheduler type.
+
+### Phase 4 — Run-Once Teardown (happens once after all epochs complete)
+
+| Step | What Runs | Where in Code | Why It Is Needed |
+| --- | --- | --- | --- |
+| 23 | **Save history JSON** | `utils.py → save_history(history, out_file)` | Writes all five metric arrays to `artifacts/history.json`. The AdamW LR trace in `history["lr"]` lets you reconstruct the full schedule without re-running the experiment. |
+| 24 | **Plot and save training curves** | `utils.py → plot_history(history, out_file)` | Renders loss and accuracy panels to `artifacts/curves.png`. The LR trace can optionally be overlaid to visually inspect how the schedule correlated with val_loss changes. |
+
+### Complete AdamW Process at a Glance
+
+The table below gives the full 24-step sequence in a single compact view for quick reference.
+
+| Step | Phase | Operation | AdamW Involvement |
+| --- | --- | --- | --- |
+| 1 | Setup | Parse CLI args | Sets `lr`, `weight_decay`, scheduler config |
+| 2 | Setup | Set global seed | Ensures reproducible weight init and data order |
+| 3 | Setup | Construct DataConfig | Determines batches-per-epoch (affects OneCycleLR total steps) |
+| 4 | Setup | Construct TrainConfig | Carries all AdamW and scheduler hyperparameters |
+| 5 | Setup | Generate dataset + DataLoaders | Provides the data stream AdamW will train on |
+| 6 | Setup | Initialize model weights | Creates parameter tensors AdamW will update |
+| 7 | Setup | **Construct AdamW** | Allocates `m` and `v` state; binds to model parameters |
+| 8 | Setup | Construct LR scheduler | Wraps AdamW; controls its `lr` field over time |
+| 9 | Per-batch | Zero gradients | Prevents gradient accumulation across batches |
+| 10 | Per-batch | Forward pass | Produces logits; activations in float16 if AMP |
+| 11 | Per-batch | Compute loss | Scalar loss is the target for backprop |
+| 12 | Per-batch | Scale loss (AMP) | Prevents float16 gradient underflow |
+| 13 | Per-batch | **Backward pass** | Populates `.grad` on every parameter |
+| 14 | Per-batch | Unscale gradients (AMP) | Restores true gradient magnitudes before AdamW reads them |
+| 15 | Per-batch | **AdamW step** | Updates `m`, `v`, applies bias correction, weight decay, parameter update |
+| 16 | Per-batch | Update GradScaler (AMP) | Adjusts scale factor for next batch |
+| 17 | Per-batch | Scheduler step (OneCycleLR only) | Updates AdamW `lr` for next batch |
+| 18 | Per-epoch | Validation pass | Measures generalization; no AdamW updates |
+| 19 | Per-epoch | Restore train mode | Re-enables dropout for next epoch's training batches |
+| 20 | Per-epoch | Scheduler step (cosine/linear) | Updates AdamW `lr` for next epoch |
+| 21 | Per-epoch | Checkpoint save (if improved) | Saves AdamW-trained weights at best val_loss |
+| 22 | Per-epoch | Record history + LR | Captures AdamW's current `lr` into the history trace |
+| 23 | Teardown | Save history JSON | Persists full AdamW LR trace and all metrics |
+| 24 | Teardown | Plot training curves | Visualizes the effect of AdamW + scheduler over epochs |
+
+> [!TIP]
+> Steps 7 and 15 are the two steps where AdamW itself is the active component. Every other step either prepares the inputs AdamW needs (steps 1–14) or records and adjusts the results of AdamW's updates (steps 16–24). Understanding this split makes it straightforward to identify which step to instrument when diagnosing a training problem.
 
 ---
 
